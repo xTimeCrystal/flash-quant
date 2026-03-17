@@ -21,6 +21,8 @@ FP8_SCALE_DTYPE = torch.float8_e4m3fn
 
 
 def _pick_row_threads(cols: int) -> int:
+    if cols >= 32768:
+        return 1024
     if cols >= 8192:
         return 512
     if cols >= 2048:
@@ -28,27 +30,6 @@ def _pick_row_threads(cols: int) -> int:
     if cols >= 512:
         return 128
     return 64
-
-
-def _pick_block_threads(block_size: int) -> int:
-    # 8 warps / CTA works well for warp-per-block mapping.
-    if block_size <= 32:
-        return 256
-    if block_size <= 128:
-        return 256
-    return 256
-
-
-def _normalize_int8_block_size(cols: int, block_size: Optional[int]) -> Tuple[int, int]:
-    if block_size is None:
-        normalized_block_size = cols
-    else:
-        require(isinstance(block_size, int), "block_size must be an int or None.")
-        require(block_size > 0, "block_size must be > 0.")
-        normalized_block_size = min(block_size, cols)
-
-    num_blocks = (cols + normalized_block_size - 1) // normalized_block_size
-    return normalized_block_size, num_blocks
 
 
 # ============================================================
@@ -62,14 +43,6 @@ __device__ __forceinline__ float bf16_to_float(unsigned short x) {
     return __int_as_float(((unsigned int)x) << 16);
 }
 
-__device__ __forceinline__ signed char round_to_int8_rn_sat(float x) {
-    x += (x >= 0.0f) ? 0.5f : -0.5f;
-    int q = (int)x;
-    if (q > 127) q = 127;
-    if (q < -127) q = -127;
-    return (signed char)q;
-}
-
 __device__ __forceinline__ unsigned short float_to_bf16_rn_bits(float x) {
     unsigned int u = __float_as_uint(x);
     unsigned int lsb = (u >> 16) & 1U;
@@ -77,7 +50,13 @@ __device__ __forceinline__ unsigned short float_to_bf16_rn_bits(float x) {
     return (unsigned short)((u + rounding_bias) >> 16);
 }
 
-__global__ void kernel_quant_int8_rowwise(
+__device__ __forceinline__ unsigned int f32_to_s8_sat(float x) {
+    unsigned int res;
+    asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(res) : "f"(x));
+    return res & 0xFF;
+}
+
+__global__ void __launch_bounds__(1024) kernel_quant_int8_rowwise(
     const unsigned short* __restrict__ x_bf16,
     signed char* __restrict__ q_i8,
     float* __restrict__ scales,
@@ -85,60 +64,44 @@ __global__ void kernel_quant_int8_rowwise(
     int cols,
     float pre_scale
 ) {
-    int row = (int)blockIdx.x;
+    int row = blockIdx.x;
     if (row >= rows) return;
 
-    int tid = (int)threadIdx.x;
-    int lane = tid & 31;
-    int warp_id = tid >> 5;
-    int num_warps = blockDim.x >> 5;
+    int tid = threadIdx.x;
+    int cols_vec = cols >> 3; 
 
-    long long row_offset = ((long long)row) * ((long long)cols);
+    long long row_offset = ((long long)row) * cols;
+    const uint4* x_row_vec = (const uint4*)(x_bf16 + row_offset);
+    uint2* q_row_vec = (uint2*)(q_i8 + row_offset);
+
+    unsigned int local_amax_i = 0;
+
+    for (int c = tid; c < cols_vec; c += blockDim.x) {
+        uint4 v = x_row_vec[c];
+        
+        // Strip sign bit (15th bit of bf16) to find absolute maximums purely via integer math
+        unsigned int w0 = v.x & 0x7FFF7FFF;
+        unsigned int w1 = v.y & 0x7FFF7FFF;
+        unsigned int w2 = v.z & 0x7FFF7FFF;
+        unsigned int w3 = v.w & 0x7FFF7FFF;
+        
+        unsigned int max01 = max(max(w0 & 0xFFFF, w0 >> 16), max(w1 & 0xFFFF, w1 >> 16));
+        unsigned int max23 = max(max(w2 & 0xFFFF, w2 >> 16), max(w3 & 0xFFFF, w3 >> 16));
+        
+        local_amax_i = max(local_amax_i, max(max01, max23));
+    }
+
     const unsigned short* x_row = x_bf16 + row_offset;
     signed char* q_row = q_i8 + row_offset;
 
-    float local_amax = 0.0f;
-
-    int vec_end = cols & ~7;  // 8 BF16 = 16 B = 1 uint4
-    for (int c = tid * 8; c < vec_end; c += blockDim.x * 8) {
-        uint4 v = ((const uint4*)(x_row + c))[0];
-        unsigned int w0 = v.x;
-        unsigned int w1 = v.y;
-        unsigned int w2 = v.z;
-        unsigned int w3 = v.w;
-
-        unsigned short a0 = (unsigned short)(w0 & 0xffff);
-        unsigned short a1 = (unsigned short)(w0 >> 16);
-        unsigned short a2 = (unsigned short)(w1 & 0xffff);
-        unsigned short a3 = (unsigned short)(w1 >> 16);
-        unsigned short a4 = (unsigned short)(w2 & 0xffff);
-        unsigned short a5 = (unsigned short)(w2 >> 16);
-        unsigned short a6 = (unsigned short)(w3 & 0xffff);
-        unsigned short a7 = (unsigned short)(w3 >> 16);
-
-        float f0 = bf16_to_float(a0) * pre_scale;
-        float f1 = bf16_to_float(a1) * pre_scale;
-        float f2 = bf16_to_float(a2) * pre_scale;
-        float f3 = bf16_to_float(a3) * pre_scale;
-        float f4 = bf16_to_float(a4) * pre_scale;
-        float f5 = bf16_to_float(a5) * pre_scale;
-        float f6 = bf16_to_float(a6) * pre_scale;
-        float f7 = bf16_to_float(a7) * pre_scale;
-
-        local_amax = fmaxf(local_amax, fabsf(f0));
-        local_amax = fmaxf(local_amax, fabsf(f1));
-        local_amax = fmaxf(local_amax, fabsf(f2));
-        local_amax = fmaxf(local_amax, fabsf(f3));
-        local_amax = fmaxf(local_amax, fabsf(f4));
-        local_amax = fmaxf(local_amax, fabsf(f5));
-        local_amax = fmaxf(local_amax, fabsf(f6));
-        local_amax = fmaxf(local_amax, fabsf(f7));
-    }
-
+    int vec_end = cols_vec << 3;
     for (int c = vec_end + tid; c < cols; c += blockDim.x) {
-        float v = bf16_to_float(x_row[c]) * pre_scale;
-        local_amax = fmaxf(local_amax, fabsf(v));
+        unsigned int w = x_row[c] & 0x7FFF;
+        local_amax_i = max(local_amax_i, w);
     }
+
+    // Convert the single integer absolute max back to float representation
+    float local_amax = __int_as_float(local_amax_i << 16) * pre_scale;
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -146,7 +109,9 @@ __global__ void kernel_quant_int8_rowwise(
     }
 
     __shared__ float warp_max[32];
-    __shared__ float shared_scale;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    int num_warps = blockDim.x >> 5;
 
     if (lane == 0) warp_max[warp_id] = local_amax;
     __syncthreads();
@@ -158,64 +123,41 @@ __global__ void kernel_quant_int8_rowwise(
             block_amax = fmaxf(block_amax, __shfl_down_sync(0xffffffff, block_amax, offset));
         }
         if (lane == 0) {
-            shared_scale = (block_amax > 0.0f) ? (block_amax * (1.0f / 127.0f)) : 1.0f;
-            scales[row] = shared_scale;
+            float scale = (block_amax > 0.0f) ? (block_amax * (1.0f / 127.0f)) : 1.0f;
+            scales[row] = scale;
+            warp_max[0] = pre_scale / scale; 
         }
     }
     __syncthreads();
 
-    float inv_scale = 1.0f / shared_scale;
+    float inv_scale = warp_max[0];
 
-    for (int c = tid * 8; c < vec_end; c += blockDim.x * 8) {
-        uint4 v = ((const uint4*)(x_row + c))[0];
-        unsigned int w0 = v.x;
-        unsigned int w1 = v.y;
-        unsigned int w2 = v.z;
-        unsigned int w3 = v.w;
+    for (int c = tid; c < cols_vec; c += blockDim.x) {
+        uint4 v = x_row_vec[c];
+        
+        // Fast bf16 extraction avoiding right shifts for the upper bits
+        float f0 = __int_as_float((v.x & 0x0000FFFF) << 16) * inv_scale;
+        float f1 = __int_as_float(v.x & 0xFFFF0000) * inv_scale;
+        float f2 = __int_as_float((v.y & 0x0000FFFF) << 16) * inv_scale;
+        float f3 = __int_as_float(v.y & 0xFFFF0000) * inv_scale;
+        float f4 = __int_as_float((v.z & 0x0000FFFF) << 16) * inv_scale;
+        float f5 = __int_as_float(v.z & 0xFFFF0000) * inv_scale;
+        float f6 = __int_as_float((v.w & 0x0000FFFF) << 16) * inv_scale;
+        float f7 = __int_as_float(v.w & 0xFFFF0000) * inv_scale;
 
-        unsigned short a0 = (unsigned short)(w0 & 0xffff);
-        unsigned short a1 = (unsigned short)(w0 >> 16);
-        unsigned short a2 = (unsigned short)(w1 & 0xffff);
-        unsigned short a3 = (unsigned short)(w1 >> 16);
-        unsigned short a4 = (unsigned short)(w2 & 0xffff);
-        unsigned short a5 = (unsigned short)(w2 >> 16);
-        unsigned short a6 = (unsigned short)(w3 & 0xffff);
-        unsigned short a7 = (unsigned short)(w3 >> 16);
+        unsigned int p0 = f32_to_s8_sat(f0) | (f32_to_s8_sat(f1) << 8) | (f32_to_s8_sat(f2) << 16) | (f32_to_s8_sat(f3) << 24);
+        unsigned int p1 = f32_to_s8_sat(f4) | (f32_to_s8_sat(f5) << 8) | (f32_to_s8_sat(f6) << 16) | (f32_to_s8_sat(f7) << 24);
 
-        float f0 = bf16_to_float(a0) * pre_scale;
-        float f1 = bf16_to_float(a1) * pre_scale;
-        float f2 = bf16_to_float(a2) * pre_scale;
-        float f3 = bf16_to_float(a3) * pre_scale;
-        float f4 = bf16_to_float(a4) * pre_scale;
-        float f5 = bf16_to_float(a5) * pre_scale;
-        float f6 = bf16_to_float(a6) * pre_scale;
-        float f7 = bf16_to_float(a7) * pre_scale;
-
-        unsigned int p0 = 0;
-        unsigned int p1 = 0;
-
-        p0 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f0 * inv_scale)) << 0;
-        p0 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f1 * inv_scale)) << 8;
-        p0 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f2 * inv_scale)) << 16;
-        p0 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f3 * inv_scale)) << 24;
-
-        p1 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f4 * inv_scale)) << 0;
-        p1 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f5 * inv_scale)) << 8;
-        p1 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f6 * inv_scale)) << 16;
-        p1 |= ((unsigned int)(unsigned char)round_to_int8_rn_sat(f7 * inv_scale)) << 24;
-
-        ((unsigned int*)(q_row + c))[0] = p0;
-        ((unsigned int*)(q_row + c + 4))[0] = p1;
+        q_row_vec[c] = make_uint2(p0, p1);
     }
 
     for (int c = vec_end + tid; c < cols; c += blockDim.x) {
-        float v = bf16_to_float(x_row[c]) * pre_scale;
-        q_row[c] = round_to_int8_rn_sat(v * inv_scale);
+        float f = __int_as_float(((unsigned int)x_row[c]) << 16) * inv_scale;
+        q_row[c] = (signed char)f32_to_s8_sat(f);
     }
 }
 
-
-__global__ void kernel_dequant_int8_rowwise(
+__global__ void __launch_bounds__(1024) kernel_dequant_int8_rowwise(
     const signed char* __restrict__ q_i8,
     const float* __restrict__ scales,
     unsigned short* __restrict__ out_bf16,
@@ -227,26 +169,27 @@ __global__ void kernel_dequant_int8_rowwise(
     if (row >= rows) return;
 
     int tid = (int)threadIdx.x;
-    long long row_offset = ((long long)row) * ((long long)cols);
+    int cols_vec = cols >> 3;
 
-    const signed char* q_row = q_i8 + row_offset;
-    unsigned short* out_row = out_bf16 + row_offset;
+    long long row_offset = ((long long)row) * ((long long)cols);
+    const uint2* q_row_vec = (const uint2*)(q_i8 + row_offset);
+    uint4* out_row_vec = (uint4*)(out_bf16 + row_offset);
 
     float mul = scales[row] * inv_pre_scale;
 
-    int vec_end = cols & ~7;  // 8 int8 -> 8 bf16
-    for (int c = tid * 8; c < vec_end; c += blockDim.x * 8) {
-        unsigned int p0 = ((const unsigned int*)(q_row + c))[0];
-        unsigned int p1 = ((const unsigned int*)(q_row + c + 4))[0];
+    for (int c = tid; c < cols_vec; c += blockDim.x) {
+        uint2 p = q_row_vec[c];
+        unsigned int p0 = p.x;
+        unsigned int p1 = p.y;
 
-        int q0 = (int)(signed char)((p0 >> 0) & 0xff);
+        int q0 = (int)(signed char)(p0 & 0xff);
         int q1 = (int)(signed char)((p0 >> 8) & 0xff);
         int q2 = (int)(signed char)((p0 >> 16) & 0xff);
-        int q3 = (int)(signed char)((p0 >> 24) & 0xff);
-        int q4 = (int)(signed char)((p1 >> 0) & 0xff);
+        int q3 = (int)(signed char)(p0 >> 24);
+        int q4 = (int)(signed char)(p1 & 0xff);
         int q5 = (int)(signed char)((p1 >> 8) & 0xff);
         int q6 = (int)(signed char)((p1 >> 16) & 0xff);
-        int q7 = (int)(signed char)((p1 >> 24) & 0xff);
+        int q7 = (int)(signed char)(p1 >> 24);
 
         unsigned short h0 = float_to_bf16_rn_bits(((float)q0) * mul);
         unsigned short h1 = float_to_bf16_rn_bits(((float)q1) * mul);
@@ -263,9 +206,12 @@ __global__ void kernel_dequant_int8_rowwise(
         out.z = ((unsigned int)h4) | (((unsigned int)h5) << 16);
         out.w = ((unsigned int)h6) | (((unsigned int)h7) << 16);
 
-        ((uint4*)(out_row + c))[0] = out;
+        out_row_vec[c] = out;
     }
 
+    int vec_end = cols_vec << 3;
+    const signed char* q_row = q_i8 + row_offset;
+    unsigned short* out_row = out_bf16 + row_offset;
     for (int c = vec_end + tid; c < cols; c += blockDim.x) {
         float v = ((float)q_row[c]) * mul;
         out_row[c] = float_to_bf16_rn_bits(v);
@@ -274,126 +220,10 @@ __global__ void kernel_dequant_int8_rowwise(
 }
 """
 
-_CUDA_SRC_INT8_BLOCKWISE = r"""
-extern "C" {
-
-__device__ __forceinline__ float bf16_to_float(unsigned short x) {
-    return __int_as_float(((unsigned int)x) << 16);
-}
-
-__device__ __forceinline__ signed char round_to_int8_rn_sat(float x) {
-    x += (x >= 0.0f) ? 0.5f : -0.5f;
-    int q = (int)x;
-    if (q > 127) q = 127;
-    if (q < -127) q = -127;
-    return (signed char)q;
-}
-
-__device__ __forceinline__ unsigned short float_to_bf16_rn_bits(float x) {
-    unsigned int u = __float_as_uint(x);
-    unsigned int lsb = (u >> 16) & 1U;
-    unsigned int rounding_bias = 0x7FFFU + lsb;
-    return (unsigned short)((u + rounding_bias) >> 16);
-}
-
-__global__ void kernel_quant_int8_blockwise(
-    const unsigned short* __restrict__ x_bf16,
-    signed char* __restrict__ q_i8,
-    float* __restrict__ scales,
-    int rows,
-    int cols,
-    int block_size,
-    int num_blocks,
-    float pre_scale
-) {
-    int lane = (int)threadIdx.x & 31;
-    int warp_id = (int)threadIdx.x >> 5;
-    int warps_per_cta = blockDim.x >> 5;
-
-    int row = (int)blockIdx.y;
-    int block_idx = (int)blockIdx.x * warps_per_cta + warp_id;
-    if (row >= rows || block_idx >= num_blocks) return;
-
-    int start = block_idx * block_size;
-    if (start >= cols) return;
-    int stop = start + block_size;
-    if (stop > cols) stop = cols;
-
-    long long row_offset = ((long long)row) * ((long long)cols);
-    const unsigned short* x_row = x_bf16 + row_offset;
-    signed char* q_row = q_i8 + row_offset;
-
-    float local_amax = 0.0f;
-    for (int c = start + lane; c < stop; c += 32) {
-        float v = bf16_to_float(x_row[c]) * pre_scale;
-        local_amax = fmaxf(local_amax, fabsf(v));
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        local_amax = fmaxf(local_amax, __shfl_down_sync(0xffffffff, local_amax, offset));
-    }
-
-    float scale = __shfl_sync(
-        0xffffffff,
-        (local_amax > 0.0f) ? (local_amax * (1.0f / 127.0f)) : 1.0f,
-        0
-    );
-    if (lane == 0) {
-        scales[((long long)row) * ((long long)num_blocks) + (long long)block_idx] = scale;
-    }
-
-    float inv_scale = 1.0f / scale;
-    for (int c = start + lane; c < stop; c += 32) {
-        float v = bf16_to_float(x_row[c]) * pre_scale;
-        q_row[c] = round_to_int8_rn_sat(v * inv_scale);
-    }
-}
-
-
-__global__ void kernel_dequant_int8_blockwise(
-    const signed char* __restrict__ q_i8,
-    const float* __restrict__ scales,
-    unsigned short* __restrict__ out_bf16,
-    int rows,
-    int cols,
-    int block_size,
-    int num_blocks,
-    float inv_pre_scale
-) {
-    int lane = (int)threadIdx.x & 31;
-    int warp_id = (int)threadIdx.x >> 5;
-    int warps_per_cta = blockDim.x >> 5;
-
-    int row = (int)blockIdx.y;
-    int block_idx = (int)blockIdx.x * warps_per_cta + warp_id;
-    if (row >= rows || block_idx >= num_blocks) return;
-
-    int start = block_idx * block_size;
-    if (start >= cols) return;
-    int stop = start + block_size;
-    if (stop > cols) stop = cols;
-
-    long long row_offset = ((long long)row) * ((long long)cols);
-    const signed char* q_row = q_i8 + row_offset;
-    unsigned short* out_row = out_bf16 + row_offset;
-
-    float mul = scales[((long long)row) * ((long long)num_blocks) + (long long)block_idx] * inv_pre_scale;
-    for (int c = start + lane; c < stop; c += 32) {
-        float v = ((float)q_row[c]) * mul;
-        out_row[c] = float_to_bf16_rn_bits(v);
-    }
-}
-}
-"""
-
-
 @dataclass
 class _Int8Kernels:
     quant_rowwise: cp.RawKernel
     dequant_rowwise: cp.RawKernel
-    quant_blockwise: cp.RawKernel
-    dequant_blockwise: cp.RawKernel
 
     @staticmethod
     def build() -> "_Int8Kernels":
@@ -402,17 +232,10 @@ class _Int8Kernels:
             options=("--std=c++17", "--use_fast_math"),
             backend="nvrtc",
         )
-        blockwise_module = cp.RawModule(
-            code=_CUDA_SRC_INT8_BLOCKWISE,
-            options=("--std=c++17", "--use_fast_math"),
-            backend="nvrtc",
-        )
 
         return _Int8Kernels(
             quant_rowwise=rowwise_module.get_function("kernel_quant_int8_rowwise"),
             dequant_rowwise=rowwise_module.get_function("kernel_dequant_int8_rowwise"),
-            quant_blockwise=blockwise_module.get_function("kernel_quant_int8_blockwise"),
-            dequant_blockwise=blockwise_module.get_function("kernel_dequant_int8_blockwise"),
         )
 
 
@@ -429,32 +252,8 @@ def _get_int8_kernels() -> _Int8Kernels:
 def quant_int8(
     x_bf16: torch.Tensor,
     *,
-    block_size: Optional[int] = None,
     pre_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Generic int8 quantization over the last dimension.
-
-    If block_size is None:
-        one scale is used for the full last dimension of each row.
-
-    If block_size is an int:
-        the last dimension is quantized in blocks of that size.
-
-    Quantization rule per block:
-        x_scaled = x * pre_scale
-        scale = max(abs(x_scaled)) / 127
-        q = round(x_scaled / scale)
-
-    Args:
-        x_bf16: CUDA BF16 tensor of shape (..., K)
-        block_size: optional block size along the last dim; None = rowwise
-        pre_scale: optional multiplicative factor before quantization
-
-    Returns:
-        q_int8: CUDA int8 tensor of shape (..., K)
-        scales: CUDA float32 tensor of shape (..., num_blocks)
-    """
     x = x_bf16.contiguous()
     require(
         x.is_cuda and x.dtype == torch.bfloat16 and x.dim() >= 1,
@@ -466,51 +265,31 @@ def quant_int8(
     cols = original_shape[-1]
     require(cols > 0, "The last dimension must be non-empty.")
 
-    normalized_block_size, num_blocks = _normalize_int8_block_size(cols, block_size)
     rows = x.numel() // cols
 
     x_2d = x.view(rows, cols)
     q_2d = torch.empty((rows, cols), device=x.device, dtype=torch.int8)
-    scales_2d = torch.empty((rows, num_blocks), device=x.device, dtype=torch.float32)
+    scales_1d = torch.empty((rows,), device=x.device, dtype=torch.float32)
 
     kernels = _get_int8_kernels()
+    threads = _pick_row_threads(cols)
+    grid = (rows,)
 
-    if num_blocks == 1:
-        threads = _pick_row_threads(cols)
-        grid = (rows,)
-        kernels.quant_rowwise(
-            grid,
-            (threads,),
-            (
-                x_2d.data_ptr(),
-                q_2d.data_ptr(),
-                scales_2d.data_ptr(),
-                rows,
-                cols,
-                cp.float32(pre_scale),
-            ),
-        )
-    else:
-        threads = _pick_block_threads(normalized_block_size)
-        warps_per_cta = threads // 32
-        grid = ((num_blocks + warps_per_cta - 1) // warps_per_cta, rows)
-        kernels.quant_blockwise(
-            grid,
-            (threads,),
-            (
-                x_2d.data_ptr(),
-                q_2d.data_ptr(),
-                scales_2d.data_ptr(),
-                rows,
-                cols,
-                normalized_block_size,
-                num_blocks,
-                cp.float32(pre_scale),
-            ),
-        )
+    kernels.quant_rowwise(
+        grid,
+        (threads,),
+        (
+            x_2d.data_ptr(),
+            q_2d.data_ptr(),
+            scales_1d.data_ptr(),
+            rows,
+            cols,
+            cp.float32(pre_scale),
+        ),
+    )
 
     q = q_2d.view(*original_shape)
-    scales = scales_2d.view(*original_shape[:-1], num_blocks)
+    scales = scales_1d.view(*original_shape[:-1])
     return q, scales
 
 
@@ -518,24 +297,8 @@ def dequant_int8(
     q_int8: torch.Tensor,
     scales: torch.Tensor,
     *,
-    block_size: Optional[int] = None,
     pre_scale: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Approximate inverse of quant_int8.
-
-    Dequantization rule per block:
-        x_hat = q_int8 * scale / pre_scale
-
-    Args:
-        q_int8: CUDA int8 tensor of shape (..., K)
-        scales: CUDA float32 tensor of shape (..., num_blocks)
-        block_size: same block size used during quantization; None = rowwise
-        pre_scale: same pre_scale used during quantization
-
-    Returns:
-        x_hat_bf16: CUDA BF16 tensor of shape (..., K)
-    """
     q = q_int8.contiguous()
     s = scales.contiguous()
 
@@ -553,8 +316,7 @@ def dequant_int8(
     cols = original_shape[-1]
     require(cols > 0, "The last dimension must be non-empty.")
 
-    normalized_block_size, num_blocks = _normalize_int8_block_size(cols, block_size)
-    expected_scale_shape = (*original_shape[:-1], num_blocks)
+    expected_scale_shape = original_shape[:-1]
     require(
         tuple(s.shape) == expected_scale_shape,
         f"scales must have shape {expected_scale_shape}, got {tuple(s.shape)}.",
@@ -562,44 +324,25 @@ def dequant_int8(
 
     rows = q.numel() // cols
     q_2d = q.view(rows, cols)
-    scales_2d = s.view(rows, num_blocks)
+    scales_1d = s.view(rows)
     out_2d = torch.empty((rows, cols), device=q.device, dtype=torch.bfloat16)
 
     kernels = _get_int8_kernels()
-
-    if num_blocks == 1:
-        threads = _pick_row_threads(cols)
-        grid = (rows,)
-        kernels.dequant_rowwise(
-            grid,
-            (threads,),
-            (
-                q_2d.data_ptr(),
-                scales_2d.data_ptr(),
-                out_2d.data_ptr(),
-                rows,
-                cols,
-                cp.float32(1.0 / pre_scale),
-            ),
-        )
-    else:
-        threads = _pick_block_threads(normalized_block_size)
-        warps_per_cta = threads // 32
-        grid = ((num_blocks + warps_per_cta - 1) // warps_per_cta, rows)
-        kernels.dequant_blockwise(
-            grid,
-            (threads,),
-            (
-                q_2d.data_ptr(),
-                scales_2d.data_ptr(),
-                out_2d.data_ptr(),
-                rows,
-                cols,
-                normalized_block_size,
-                num_blocks,
-                cp.float32(1.0 / pre_scale),
-            ),
-        )
+    threads = _pick_row_threads(cols)
+    grid = (rows,)
+    
+    kernels.dequant_rowwise(
+        grid,
+        (threads,),
+        (
+            q_2d.data_ptr(),
+            scales_1d.data_ptr(),
+            out_2d.data_ptr(),
+            rows,
+            cols,
+            cp.float32(1.0 / pre_scale),
+        ),
+    )
 
     return out_2d.view(*original_shape)
 
